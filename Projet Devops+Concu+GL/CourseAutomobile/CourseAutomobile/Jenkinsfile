@@ -1,0 +1,88 @@
+// Pipeline CI/CD – CourseAutomobile (Git, GitHub, Jenkins, Docker ; compilation avec javac)
+pipeline {
+    agent any
+
+    triggers {
+        // Si Jenkins n'est pas joignable depuis Internet : interrogation périodique du dépôt
+        pollSCM('H/5 * * * *')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 15, unit: 'MINUTES')
+    }
+
+    environment {
+        IMAGE     = 'course-automobile'
+        CONTENEUR = "course-run-${env.BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('CODE - Récupération des sources') {
+            steps {
+                checkout scm            // dépôt GitHub CourseAutomobile (branche main)
+                sh 'git log -1 --oneline'
+            }
+        }
+
+        stage('BUILD - Compilation (javac)') {
+            steps {
+                sh '''
+                    rm -rf out && mkdir -p out/main out/test
+                    javac -encoding UTF-8 -d out/main $(find src/main -name "*.java")
+                    javac -encoding UTF-8 -cp out/main -d out/test $(find src/test -name "*.java")
+                '''
+            }
+        }
+
+        stage('TEST - Tests automatisés') {
+            steps {
+                // TestRunner retourne un code de sortie non nul au moindre échec -> pipeline en échec
+                sh 'java -cp out/main:out/test course.test.TestRunner'
+            }
+        }
+
+        stage('RELEASE - Version stable') {
+            steps {
+                // Le tag v1.0.0 est créé sur main après validation ; on l'affiche ici pour la traçabilité
+                sh 'git fetch --tags || true; git tag -l "v*" || true; git describe --tags --always || true'
+            }
+        }
+
+        stage('DEPLOY - Image Docker et conteneur') {
+            steps {
+                sh '''
+                    docker build -t ${IMAGE}:latest .
+                    docker rm -f ${CONTENEUR} 2>/dev/null || true
+                    # pas de --rm : on conserve le conteneur arrêté pour lire ses logs et son code de sortie
+                    docker run --name ${CONTENEUR} ${IMAGE}:latest
+                '''
+            }
+        }
+
+        stage('OPERATE - Vérification de l\'exécution') {
+            steps {
+                sh '''
+                    docker ps -a --filter "name=${CONTENEUR}"
+                    CODE=$(docker inspect -f '{{.State.ExitCode}}' ${CONTENEUR})
+                    echo "Code de sortie du conteneur : ${CODE}"
+                    test "${CODE}" = "0"
+                '''
+            }
+        }
+
+        stage('MONITOR - Logs') {
+            steps {
+                sh 'docker logs ${CONTENEUR} | tail -n 15'
+                sh 'docker logs ${CONTENEUR} | grep -q "Gagnant"'
+            }
+        }
+    }
+
+    post {
+        success { echo 'Pipeline terminé avec succès.' }
+        failure { echo 'Pipeline en échec : consulter la console Jenkins et les logs du conteneur.' }
+        always  { sh 'docker logs ${CONTENEUR} > logs-conteneur.txt 2>&1 || true'
+                  archiveArtifacts artifacts: 'logs-conteneur.txt', allowEmptyArchive: true }
+    }
+}
